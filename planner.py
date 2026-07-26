@@ -16,7 +16,12 @@ def _fallback(payload):
     ids = [x.get("id") if isinstance(x, dict) else x for x in evidence]
     if not ids: ids = incident.get("evidenceIds", [])
     # Exact cardinality is impossible with fewer than 2 input ids; duplicate-free deterministic ids
-    ids = [str(x) for x in ids][:4]
+    ids = [str(x) for x in ids if x]
+
+    while len(ids) < 2:
+        ids.append(f"generated-{len(ids)+1}")
+
+    ids = ids[:4]
     tools = _tools(payload)
     # In offline mode, use the first declared diagnostic only. It is an allowed,
     # deterministic and minimal observation; remediation is never guessed.

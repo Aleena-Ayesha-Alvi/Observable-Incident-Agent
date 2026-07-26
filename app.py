@@ -34,7 +34,8 @@ def create_incident(payload: dict, db: Session = Depends(get_db)):
         run = initial_run(payload)
         db.add(IncidentRun(run_id=run_id, status=run["status"], request_json=canonical(safe), response_json=canonical(run), request_hash=request_hash)); db.commit()
         return run
-    except LookupError as exc: raise HTTPException(422, detail=str(exc))
+    except LookupError as exc:
+        raise HTTPException(409, detail=str(exc))
     except ValueError as exc: raise HTTPException(400, detail=str(exc))
 
 @app.get("/v2/incidents/{runId}")
