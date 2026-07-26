@@ -3,7 +3,7 @@ from fastapi import Depends, FastAPI, HTTPException
 from sqlalchemy.orm import Session
 from database import Base, engine, get_db
 from models import IncidentRun, ReceiptRecord
-from state_machine import initial_run
+from state_machine import initial_run, validate_payload
 from receipts import apply_receipt
 from utils import canonical, digest, redact
 
@@ -25,8 +25,12 @@ def home(): return {"status": "running"}
 @app.post("/v2/incidents")
 def create_incident(payload: dict, db: Session = Depends(get_db)):
     try:
-        safe = redact(payload); request_hash = digest(payload); run_id = safe.get("runId")
-        if not run_id: raise ValueError("runId is required")
+        # Validate before consulting persistence.  Otherwise a malformed request
+        # can be misreported as a replay conflict merely because its runId exists.
+        validate_payload(payload)
+        safe = redact(payload)
+        request_hash = digest(payload)
+        run_id = payload["runId"]
         existing = db.query(IncidentRun).filter(IncidentRun.run_id == run_id).first()
         if existing:
             if existing.request_hash == request_hash: return stored_run(existing)
@@ -35,7 +39,7 @@ def create_incident(payload: dict, db: Session = Depends(get_db)):
         db.add(IncidentRun(run_id=run_id, status=run["status"], request_json=canonical(safe), response_json=canonical(run), request_hash=request_hash)); db.commit()
         return run
     except LookupError as exc:
-        raise HTTPException(409, detail=str(exc))
+        raise HTTPException(400, detail=str(exc))
     except ValueError as exc: raise HTTPException(400, detail=str(exc))
 
 @app.get("/v2/incidents/{runId}")
