@@ -1,38 +1,122 @@
-"""Small deterministic helpers used by API, state and telemetry code."""
-import copy
+"""
+utils.py
+"""
+
 import hashlib
 import json
-import re
-import uuid
+import secrets
+from copy import deepcopy
 
-SENSITIVE_KEYS = {"sensitive", "authorization", "token", "password", "secret", "api_key", "apikey", "transcript", "prompt", "tool_results", "tool_result"}
 
-def canonical(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+REDACT_KEYS = {
+    "authorization",
+    "access_token",
+    "accessToken",
+    "apiKey",
+    "apikey",
+    "password",
+    "secret",
+    "token",
+    "privateNote",
+    "sensitive",
+}
 
-def digest(value):
-    return hashlib.sha256(canonical(value).encode()).hexdigest()
 
-def stable_id(prefix, *parts, length=32):
-    return prefix + hashlib.sha256("|".join(map(str, parts)).encode()).hexdigest()[:length]
+def canonical(obj):
+    return json.dumps(
+        obj,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
 
-def trace_id(seed):
-    return hashlib.sha256(("trace|" + seed).encode()).hexdigest()[:32]
 
-def span_id(seed):
-    return hashlib.sha256(("span|" + seed).encode()).hexdigest()[:16]
+def digest(obj):
+    return hashlib.sha256(
+        canonical(obj).encode("utf-8")
+    ).hexdigest()
 
-def parse_traceparent(value):
-    if not isinstance(value, str): return None
-    match = re.fullmatch(r"00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})", value.lower())
-    return match.groups() if match else None
 
-def redact(value):
-    """Remove fields which are never allowed in storage, response, or OTLP."""
+def stable_id(prefix, *parts):
+    h = hashlib.sha256()
+
+    for part in parts:
+        h.update(str(part).encode("utf-8"))
+        h.update(b"|")
+
+    return prefix + h.hexdigest()[:24]
+
+
+def trace_id(seed=None):
+    if seed:
+        return hashlib.sha256(
+            str(seed).encode()
+        ).hexdigest()[:32]
+
+    while True:
+        tid = secrets.token_hex(16)
+        if tid != "0" * 32:
+            return tid
+
+
+def span_id(seed=None):
+    if seed:
+        return hashlib.sha256(
+            str(seed).encode()
+        ).hexdigest()[:16]
+
+    while True:
+        sid = secrets.token_hex(8)
+        if sid != "0" * 16:
+            return sid
+
+
+def parse_traceparent(header):
+    if not header:
+        return None
+
+    try:
+        version, trace, parent, flags = header.split("-")
+        if version != "00":
+            return None
+
+        if (
+            len(trace) != 32
+            or len(parent) != 16
+        ):
+            return None
+
+        return (
+            trace.lower(),
+            parent.lower(),
+            flags.lower(),
+        )
+
+    except Exception:
+        return None
+
+
+def _redact(value):
     if isinstance(value, dict):
-        return {k: redact(v) for k, v in value.items() if k.lower() not in SENSITIVE_KEYS}
-    if isinstance(value, list): return [redact(v) for v in value]
-    return copy.deepcopy(value)
 
-def jsonable(value):
-    return json.loads(canonical(value))
+        result = {}
+
+        for key, val in value.items():
+
+            if str(key).lower() in {
+                k.lower() for k in REDACT_KEYS
+            }:
+                result[key] = "[REDACTED]"
+            else:
+                result[key] = _redact(val)
+
+        return result
+
+    if isinstance(value, list):
+        return [_redact(v) for v in value]
+
+    return value
+
+
+def redact(obj):
+    return _redact(deepcopy(obj))

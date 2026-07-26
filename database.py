@@ -1,12 +1,34 @@
-"""SQLite persistence for incident runs (the database is intentionally self-contained)."""
+"""
+database.py
+SQLite database configuration
+"""
+
 import os
+
 from sqlalchemy import create_engine
 from sqlalchemy.orm import declarative_base, sessionmaker
 
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./incident.db")
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///./incident_agent.db"
+)
+
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={"check_same_thread": False}
+    if DATABASE_URL.startswith("sqlite")
+    else {},
+    pool_pre_ping=True,
+)
+
+SessionLocal = sessionmaker(
+    bind=engine,
+    autoflush=False,
+    autocommit=False,
+)
+
 Base = declarative_base()
+
 
 def get_db():
     db = SessionLocal()
@@ -14,3 +36,13 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+def create_tables():
+    """
+    Import models before creating tables
+    to avoid circular imports.
+    """
+    import models
+
+    Base.metadata.create_all(bind=engine)

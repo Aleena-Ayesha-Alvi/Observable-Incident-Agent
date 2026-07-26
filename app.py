@@ -62,10 +62,16 @@ def receipt(runId: str, payload: dict, db: Session = Depends(get_db)):
     # only a sensitive field changed, without persisting that field itself.
     h = digest(payload); old = db.query(ReceiptRecord).filter(ReceiptRecord.run_id == runId, ReceiptRecord.receipt_id == rid).first()
     if old:
-        if old.receipt_hash == h: return json.loads(old.response_json)
+        if old.receipt_hash == h: return Response(content=old.response_json, media_type="application/json")
         conflict("receiptId replay has changed content")
     try:
-        run = stored_run(row); result = apply_receipt(run, payload); save_run(db, row, run)
-        db.add(ReceiptRecord(run_id=runId, receipt_id=rid, receipt_hash=h, response_json=canonical(result))); db.commit()
-        return result
+        run = stored_run(row)
+        result = apply_receipt(run, payload)
+        response_json = canonical(result)
+        row.status = run["status"]
+        row.response_json = canonical(run)
+        db.add(row)
+        db.add(ReceiptRecord(run_id=runId, receipt_id=rid, receipt_hash=h, response_json=response_json))
+        db.commit()
+        return Response(content=response_json, media_type="application/json")
     except ValueError as exc: raise HTTPException(409, detail=str(exc))

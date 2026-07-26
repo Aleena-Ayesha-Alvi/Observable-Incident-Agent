@@ -1,62 +1,174 @@
-"""Safe Gemini-backed planner. A deterministic local plan is used if Gemini is unavailable."""
+"""
+planner.py
+
+Gemini-backed incident planner with deterministic fallback.
+"""
+
 import json
 import os
+
 from utils import redact
 
-def _tools(payload):
-    raw = payload.get("tools", payload.get("availableTools", payload.get("incident", {}).get("tools", [])))
-    return raw if isinstance(raw, list) else []
 
-def _tool_name(tool): return tool.get("toolName") or tool.get("name") if isinstance(tool, dict) else None
+def _tool_catalog(payload):
+    tools = (
+        payload.get("toolCatalog")
+        or payload.get("tools")
+        or []
+    )
+
+    result = []
+
+    for tool in tools:
+        if isinstance(tool, dict):
+            name = (
+                tool.get("name")
+                or tool.get("toolName")
+            )
+            if name:
+                result.append(tool)
+
+    return result
+
 
 def _fallback(payload):
-    incident = payload.get("incident", {})
-    causes = incident.get("allowedRootCauses", payload.get("allowedRootCauses", []))
-    evidence = incident.get("evidence", payload.get("evidence", []))
-    ids = [x.get("id") if isinstance(x, dict) else x for x in evidence]
-    if not ids: ids = incident.get("evidenceIds", [])
-    # Exact cardinality is impossible with fewer than 2 input ids; duplicate-free deterministic ids
-    ids = [str(x) for x in ids if x]
+    incident = payload["incident"]
 
-    while len(ids) < 2:
-        ids.append(f"generated-{len(ids)+1}")
+    causes = incident.get("allowedRootCauses", [])
 
-    ids = ids[:4]
-    tools = _tools(payload)
-    # In offline mode, use the first declared diagnostic only. It is an allowed,
-    # deterministic and minimal observation; remediation is never guessed.
+    root = causes[0] if causes else "unknown"
+
+    transcript = incident.get("transcript", "")
+
+    evidence = []
+
+    for line in transcript.splitlines():
+        line = line.strip()
+        if line.startswith("[") and "]" in line:
+            evidence.append(line.split("]")[0][1:])
+
+    evidence = evidence[:4]
+
+    while len(evidence) < 2:
+        evidence.append(f"generated-{len(evidence)+1}")
+
     diagnostics = []
+
+    tools = _tool_catalog(payload)
+
     if tools:
-        name = _tool_name(tools[0])
-        if name:
-            diagnostics.append({"toolName": name, "arguments": redact(tools[0].get("arguments", {})), "evidence": ids[:2]})
-    return {"rootCause": causes[0] if causes else "unknown", "evidence": ids, "diagnostics": diagnostics}
+        diagnostics.append(
+            {
+                "toolName": tools[0]["name"],
+                "arguments": {},
+                "evidence": evidence[:2],
+            }
+        )
+
+    return {
+        "rootCause": root,
+        "evidence": evidence,
+        "diagnostics": diagnostics,
+    }
+
 
 def plan_incident(payload):
-    """Return constrained plan without passing sensitive/transcript data to Gemini."""
+
     safe = redact(payload)
+
     fallback = _fallback(safe)
-    allowed = safe.get("incident", {}).get("allowedRootCauses", safe.get("allowedRootCauses", []))
-    tool_names = [_tool_name(t) for t in _tools(safe) if _tool_name(t)]
-    max_diagnostics = int(safe.get("policy", {}).get("maximumDiagnostics", len(tool_names) or 0))
-    if not os.getenv("GEMINI_API_KEY"):
+
+    if "GEMINI_API_KEY" not in os.environ:
         return fallback
+
     try:
+
         import google.generativeai as genai
-        genai.configure(api_key=os.environ["GEMINI_API_KEY"])
-        prompt = ("Return only JSON. Choose one rootCause only from " + json.dumps(allowed) +
-                  ". Select 2-4 evidence IDs only from supplied IDs. Select only necessary diagnostics "
-                  "using toolName only from " + json.dumps(tool_names) + ". Do not include secrets, transcript, or explanations. "
-                  "Context: " + json.dumps({"incident": safe.get("incident", {}), "policy": safe.get("policy", {})}))
-        text = genai.GenerativeModel(os.getenv("GEMINI_MODEL", "gemini-2.5-flash")).generate_content(prompt).text.strip()
-        text = text.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+
+        genai.configure(
+            api_key=os.environ["GEMINI_API_KEY"]
+        )
+
+        model = genai.GenerativeModel(
+            os.getenv(
+                "GEMINI_MODEL",
+                "gemini-2.5-flash",
+            )
+        )
+
+        allowed = safe["incident"].get(
+            "allowedRootCauses",
+            [],
+        )
+
+        tools = [
+            t["name"]
+            for t in _tool_catalog(safe)
+        ]
+
+        prompt = f"""
+You are an incident response planner.
+
+Return ONLY JSON.
+
+Schema:
+
+{{
+  "rootCause":"one of {allowed}",
+  "evidence":["id1","id2"],
+  "diagnostics":[
+      {{
+        "toolName":"one of {tools}",
+        "arguments":{{}},
+        "evidence":["id1"]
+      }}
+  ]
+}}
+
+Rules:
+
+- Pick exactly one allowed root cause.
+- Choose 2-4 evidence IDs.
+- Use at most 3 diagnostic tools.
+- Never include explanations.
+- Never include markdown.
+- Never include transcript.
+- Never reveal secrets.
+
+Incident:
+
+{json.dumps(safe["incident"])}
+"""
+
+        response = model.generate_content(prompt)
+
+        text = (
+            response.text
+            .replace("```json", "")
+            .replace("```", "")
+            .strip()
+        )
+
         result = json.loads(text)
-        if result.get("rootCause") not in allowed: return fallback
-        ev = result.get("evidence", [])
-        legal_ev = set(fallback["evidence"])
-        if not isinstance(ev, list) or not 2 <= len(ev) <= 4 or any(str(x) not in legal_ev for x in ev): return fallback
-        diagnostics = result.get("diagnostics", [])[:max_diagnostics]
-        if not all(isinstance(d, dict) and d.get("toolName") in tool_names for d in diagnostics): return fallback
-        return {"rootCause": result["rootCause"], "evidence": ev, "diagnostics": diagnostics}
+        diagnostics = result.get("diagnostics", [])
+
+        valid_tools = set(tools)
+
+        diagnostics = [
+            d
+            for d in diagnostics
+            if d.get("toolName") in valid_tools
+        ]
+
+        result["diagnostics"] = diagnostics[:3]
+
+        if (
+            result.get("rootCause")
+            not in allowed
+        ):
+            return fallback
+
+        return result
+
     except Exception:
         return fallback
